@@ -1,14 +1,118 @@
 # PBA Repository
+
 This repository includes the Python scripts for the research paper ["PBA: Percentile-Based Level Allocation for Multiple-Bits-Per-Cell RRAM"](https://cs.stanford.edu/~anjiang/papers/ICCAD23PBA.pdf), at ICCAD'23.
 
+---
+
 ## Hardware Measurement Data
-We conduct experiments on two ember chips and measure the resistance at the timestamp of 1 second.
+
+We conduct experiments on two Ember RRAM chips and measure the resistance at the timestamp of 1 second.
 
 The raw data for ember chip [1](https://github.com/Anjiang-Wei/PBA/blob/dala/data/retention1s.csv) and [2](https://github.com/Anjiang-Wei/PBA/blob/dala/data/retention1s2.csv) are provided.
 
 We then build a more compact representation of the data points with scripts [1](https://github.com/Anjiang-Wei/PBA/blob/dala/analysis/build_retention_model.py) and [2](https://github.com/Anjiang-Wei/PBA/blob/dala/analysis/build_retention_model2.py) respectively, generating two files [1](https://github.com/Anjiang-Wei/PBA/blob/dala/model/retention1s.csv) and [2](https://github.com/Anjiang-Wei/PBA/blob/dala/model/retention1s2.csv) in the format of `write_level_low, write_level_high, (list of levels)` where `list_of_levels` is the readout level index after waiting for 1 second.
 
-## Experiments
+---
+
+## Markov Chain Optimal Programming Model
+
+In addition to the PBA level-allocation work, this repository contains an MDP-based optimal programming model built from sweep data.
+
+**Goal**: given a cell's current resistance state, find the minimum-pulse sequence to reach any target state.
+
+### Datasets: Sweep Files
+
+Four files capture single-pulse transition statistics across two chips:
+
+| File | Chip | Type | Rows | Cells/row | Total transitions |
+|------|------|------|------|-----------|-------------------|
+| `data/setsweep1.csv` | 1 | SET | 7,680 | 15 | 115,200 |
+| `data/setsweep2.csv` | 2 | SET | 131,072 | 16 | 2,097,152 |
+| `data/resetsweep1.csv` | 1 | RESET | 65,536 | 16 | 1,048,576 |
+| `data/resetsweep2.csv` | 2 | RESET | 131,072 | 16 | 2,097,152 |
+
+**Column layout** (auto-detected by script):
+```
+addr | timestamp | vwl | vbsl | pw | gi[0..N] | [artifact] | gf[0..N]
+```
+- `vwl`: wordline voltage DAC code (0–254, step 2) — dominant pulse strength control
+- `vbsl`: bitline-select voltage DAC code (0–31) — chip1 step=8, chip2 step=4
+- `pw`: pulse width in ns (powers of 2, up to 2048; chip2 adds pw=3968)
+- `gi[k]`: pre-pulse resistance state of cell k (ADC level 0–64, linear in conductance)
+- `gf[k]`: post-pulse resistance state of cell k
+- SET pulses drive resistance **down** (higher conductance); RESET pulses drive it **up**
+
+**Note**: ADC levels are linear in conductance (G = 1/R), not resistance. ADC≈64 corresponds to ~6–8 kΩ (LRS); ADC≈2 corresponds to >100 kΩ (HRS).
+
+### Step 1: Single-Step Reachability (`visualizations/single_step_reachability.py`)
+
+Maps every observed single-step transition across all four files. Output: `transition_map_both.png`, `transition_coverage.png`.
+
+Key results:
+- SET: 3,139 unique (s → s') pairs; avg 48.3 reachable states per initial state
+- RESET: 2,686 unique pairs; avg 41.3 reachable states per initial state
+
+### Step 2: Transitive Closure (`visualizations/transitive_closure.py`)
+
+Computes multi-step reachability via repeated boolean matrix multiplication. Output: `closure_reachability.png`, `closure_by_steps.png`, `closure_gaps.png`.
+
+Key results:
+- Converged in **3 steps** — all 65 states are reachable from all others in ≤3 pulses
+- This proves a finite optimal policy exists for every (s, target) pair
+
+### Step 3: Parameter Sensitivity (`visualizations/param_sensitivity.py`)
+
+Measures how much `vbsl` and `pw` affect final state independently of `vwl`. Computes the spread of mean Δs across parameter values for each (vwl, s) combination.
+
+Key results:
+
+| Parameter | SET median spread | RESET median spread | vs. vwl effect |
+|-----------|-------------------|---------------------|----------------|
+| vwl       | 17.9 states       | 1.6 states          | baseline       |
+| **vbsl**  | **17.1 states**   | **3.4 states**      | SET: 96%, RESET: 221% |
+| pw        | 7.1 states        | 2.4 states          | SET: 40%, RESET: 154% |
+
+**Conclusion**: pooling over `vbsl` and `pw` is significantly lossy — `vbsl` alone has nearly as much effect as `vwl` for SET pulses, and exceeds `vwl`'s effect for RESET pulses. Expanding the action space beyond `(type, vwl)` is recommended.
+
+### Step 4: Transition Matrix (`markov/build_chain.py`)
+
+Builds `T[action, s, s']` — the probability of transitioning from state `s` to `s'` under action `a`.
+
+Current action space (baseline, vbsl/pw pooled):
+- Actions 0–127: SET pulses, indexed by `vwl // 2`
+- Actions 128–255: RESET pulses, indexed by `128 + vwl // 2`
+
+Outputs: `markov/transition_counts.npy` [256, 65, 65], `markov/transition_probs.npy` [256, 65, 65], `markov/action_info.csv`.
+
+Parameters: `MIN_COUNT = 3` (rows with fewer observations are zeroed out).
+
+Coverage: 16,231 / 16,640 (action, s) pairs have sufficient observations. Only state 0 (minimum conductance) has no valid outgoing actions.
+
+### Step 5: Value Iteration (`markov/value_iteration.py`)
+
+Solves the Stochastic Shortest Path (SSP) problem via value iteration to compute the optimal policy.
+
+**Bellman equation**:
+```
+V[s, t] = 0                               if s == t (already at target)
+V[s, t] = min_a { 1 + P[a,s,:] · V[:,t] }  otherwise
+```
+
+`V[s, t]` = expected number of pulses to reach target `t` from state `s` using the optimal policy. Converges from V=0 (optimistic initialization) upward.
+
+Outputs: `markov/value_function.npy`, `markov/policy.npy`, `markov/policy_vwl.npy`, `markov/policy_type.npy`.
+
+Key results (baseline, vbsl/pw pooled):
+- Converged in 328 iterations (policy stability criterion)
+- **Mean expected pulses: 24.8** across all reachable (s, target) pairs
+- **Max expected pulses: 303** (s=32 → t=0, cross-range against gradient)
+- 4,096 / 4,160 off-diagonal pairs reachable; 64 unreachable (all from state 0)
+
+This policy is the **optimal baseline**: no algorithm operating on the same transition model can do better in expectation.
+
+---
+
+## PBA Experiments
 
 ### SBA versus PBA
 With the SBA [implementation](https://github.com/Anjiang-Wei/PBA/blob/dala/algorithm/SBA.py), we generate the probability transition matrix with this [script](https://github.com/Anjiang-Wei/PBA/blob/dala/algorithm/SBA_genmatrix.py), and the matrix is saved [here](https://github.com/Anjiang-Wei/PBA/tree/dala/ember_capacity) (`SBA4`, `SBA8`) for chip1, and [here](https://github.com/Anjiang-Wei/PBA/tree/dala/ember_capacity2) (`SBA4`, `SBA8`) for chip2.
