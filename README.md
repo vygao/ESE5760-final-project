@@ -110,6 +110,28 @@ Key results (baseline, vbsl/pw pooled):
 
 This policy is the **optimal baseline**: no algorithm operating on the same transition model can do better in expectation.
 
+### Step 6: Monte Carlo Simulation (`markov/monte_carlo.py`)
+
+**Goal**: validate the value function empirically and characterize the full pulse-count distribution (not just the mean).
+
+Value iteration produces *expected* pulse counts under the model. Monte Carlo simulation rolls out the policy stochastically — sampling actual next states from `T[a, s, :]` at each step — and records what actually happens over many trials.
+
+**Planned outputs**: `markov/mc_pulse_counts.npy` [65, 65, N_trials], summary stats CSV.
+
+Procedure:
+1. Load `transition_probs.npy` and `policy.npy`
+2. For each (s, t) pair, run N rollouts:
+   - Apply `policy[current, t]`, sample next state from `T[action, current, :]`
+   - Repeat until `current == t` or a max-pulse timeout is hit
+   - Record total pulse count and whether the rollout succeeded
+3. Compute per-(s,t): empirical mean, standard deviation, 90th/99th percentile, success rate
+
+**Validation**: plot empirical mean vs `V[s, t]` — should match closely if the transition model is consistent. Large deviations flag model/data issues.
+
+**Distribution analysis**: the mean alone hides heavy tails. Plot pulse-count histograms for representative (s, t) pairs (e.g. easy same-direction, hard cross-range). Percentiles matter for real system design — a 99th-percentile worst case of 500 pulses is very different from a mean of 25.
+
+**SET/RESET interleaving analysis**: track how often the optimal policy switches between SET and RESET mid-sequence. This is an open hardware question — SET and RESET are physically distinct at the circuit level (different voltage lines driven), so freely interleaved sequences may not be realizable on Ember without further validation.
+
 ---
 
 ## PBA Experiments
