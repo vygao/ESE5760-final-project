@@ -132,6 +132,73 @@ Procedure:
 
 **SET/RESET interleaving analysis**: track how often the optimal policy switches between SET and RESET mid-sequence. This is an open hardware question — SET and RESET are physically distinct at the circuit level (different voltage lines driven), so freely interleaved sequences may not be realizable on Ember without further validation.
 
+Key results (1024-action model, vbsl-expanded):
+- 100% success rate across all reachable (s, target) pairs within 1500 steps
+- **Mean pulses (empirical): 6.22** — matches theoretical value function exactly, validating the model
+- **p90: 11.9 pulses**, **p99: 21.4 pulses** — tails are moderate
+- **Max p99: 163 pulses** (worst-case pair)
+
+Outputs: `markov/mc_pulse_counts.npy`, `markov/mc_timed_out.npy`, `markov/mc_summary.csv`, `markov/mc_mean_switches.npy`, plus figures `mc_mean_vs_theoretical.png`, `mc_percentiles.png`, `mc_histograms.png`, `mc_interleaving.png`.
+
+---
+
+### Step 7: Pulse-Width-Binned Action Space (`markov/build_chain_pw.py`)
+
+**Goal**: replace pw pooling with explicit pw bins, giving the policy finer control over pulse strength and a more realistic action space.
+
+The current model pools over all pulse widths, collapsing them into a single marginal distribution per (vwl, vbsl, type). Parameter sensitivity (Step 3) showed pw has ~40% the effect of vwl for SET and ~154% for RESET — especially for RESET, this pooling is significantly lossy.
+
+**pw values in the data** (powers of 2): chip1 uses 1–128 ns, chip2 uses 1–16 ns. A natural log-scale binning:
+
+| Bin | pw range (ns) | Rationale |
+|-----|--------------|-----------|
+| 0   | 1–2          | shortest pulses — fine trimming |
+| 1   | 4–8          | medium-short |
+| 2   | 16–32        | medium-long |
+| 3   | 64–128       | longest — coarse jumps |
+
+This expands the action space from 1024 to **4096** (2 types × 128 vwl × 4 vbsl bins × 4 pw bins). Data density will be ~4x thinner per action — `MIN_COUNT` threshold becomes more important. Pairs with insufficient data in a given pw bin fall back to the pooled estimate or are masked out.
+
+Procedure: duplicate `build_chain.py`, add `pw_to_bin()` mapping, include pw bin in the action index formula, re-run value iteration and Monte Carlo on the new transition matrix.
+
+Expected outcome: lower mean expected pulses and tighter pulse-count distributions, particularly for RESET-dominated programming sequences.
+
+---
+
+### Step 8: Multi-Bit Cell Evaluation and Comparison to RADAR/PBA
+
+**Goal**: translate the pulse-level MDP results into the metric that matters for real memory systems — bit error rate (BER) when programming a 2-bit (4-level) or 3-bit (8-level) MLC cell — and compare directly against RADAR and PBA.
+
+#### Bin definitions
+
+Partition the 65 ADC states into equal-width bins (or PBA-style percentile bins):
+
+| Configuration | Bins | States per bin |
+|--------------|------|----------------|
+| 2-bit MLC    | 4    | ~16 states     |
+| 3-bit MLC    | 8    | ~8 states      |
+
+Each bin represents one resistance level; a cell is correctly programmed if it lands anywhere within the target bin.
+
+#### MDP reformulation (bin-level targets)
+
+Re-solve value iteration with bin-level absorbing states: any state within the target bin counts as done. This yields `V_bin[s, b]` — the expected pulses to reach bin `b` from state `s` — and a corresponding optimal bin-level policy. This is the correct formulation for comparing against RADAR (which also targets a resistance window, not a single state).
+
+The per-state policy from Step 5 is a suboptimal approximation for this task: it over-commits to a single centroid state and may waste pulses trying to hit an exact level when the cell is already inside the target window.
+
+#### Monte Carlo BER measurement
+
+Simulate the bin-level policy and record:
+- **Success rate**: fraction of rollouts that land in the correct bin
+- **Expected pulses**: total pulses per successful program operation
+- **BER**: per-bit error rate under gray coding, as a function of write budget (pulses)
+
+#### Comparison baseline
+
+RADAR is an iterative write-verify scheme: apply a pulse, read back, repeat until within tolerance. PBA/SBA (from this repo) optimize level allocation but use a fixed write algorithm. The MDP policy is the **theoretical optimum** under the learned transition model — it provides a lower bound on expected pulses for any algorithm operating on the same hardware.
+
+Report the gap: how many more pulses does RADAR use vs. the MDP optimum for the same target BER?
+
 ---
 
 ## PBA Experiments
