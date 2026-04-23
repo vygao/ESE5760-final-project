@@ -142,62 +142,130 @@ Outputs: `markov/mc_pulse_counts.npy`, `markov/mc_timed_out.npy`, `markov/mc_sum
 
 ---
 
-### Step 7: Pulse-Width-Binned Action Space (`markov/build_chain_pw.py`)
+### Step 7: Pulse-Width-Binned Action Space and Bin-Level MDP (`markov/build_chain.py`, `markov/bin_vi.py`)
 
-**Goal**: replace pw pooling with explicit pw bins, giving the policy finer control over pulse strength and a more realistic action space.
+#### Action space
 
-The current model pools over all pulse widths, collapsing them into a single marginal distribution per (vwl, vbsl, type). Parameter sensitivity (Step 3) showed pw has ~40% the effect of vwl for SET and ~154% for RESET — especially for RESET, this pooling is significantly lossy.
+The action space is parameterised by `pw_bins` — the number of log-scale pulse-width bins. `pw_bins=1` pools all pulse widths (baseline); higher values separate short from long pulses:
 
-**pw values in the data** (powers of 2): chip1 uses 1–128 ns, chip2 uses 1–16 ns. A natural log-scale binning:
+| `pw_bins` | Composition | Total actions |
+|-----------|-------------|---------------|
+| 1 (pooled) | 2 types × 128 vwl × 4 vbsl bins × 1 pw bin | **1,024** |
+| 2 | 2 × 128 × 4 × 2 pw bins | **2,048** |
+| 4 | 2 × 128 × 4 × 4 pw bins | **4,096** |
 
-| Bin | pw range (ns) | Rationale |
-|-----|--------------|-----------|
-| 0   | 1–2          | shortest pulses — fine trimming |
-| 1   | 4–8          | medium-short |
-| 2   | 16–32        | medium-long |
-| 3   | 64–128       | longest — coarse jumps |
+pw values in the data are powers of 2: chip1 uses 1–128 ns, chip2 uses 1–16 ns (RESET sweeps even narrower: chip1 1–8 ns, chip2 1–2 ns). The log-scale binning for `pw_bins=4` is: [1–2 ns], [4–8 ns], [16–32 ns], [64–128 ns].
 
-This expands the action space from 1024 to **4096** (2 types × 128 vwl × 4 vbsl bins × 4 pw bins). Data density will be ~4x thinner per action — `MIN_COUNT` threshold becomes more important. Pairs with insufficient data in a given pw bin fall back to the pooled estimate or are masked out.
+Build transition matrices for each `pw_bins` value:
+```
+python markov/build_chain.py --pw-bins 1   # → transition_probs_pw1.npy [1024, 65, 65]
+python markov/build_chain.py --pw-bins 2   # → transition_probs_pw2.npy [2048, 65, 65]
+python markov/build_chain.py --pw-bins 4   # → transition_probs_pw4.npy [4096, 65, 65]
+```
 
-Procedure: duplicate `build_chain.py`, add `pw_to_bin()` mapping, include pw bin in the action index formula, re-run value iteration and Monte Carlo on the new transition matrix.
+#### Bin-level value iteration (`markov/bin_vi.py`)
 
-Expected outcome: lower mean expected pulses and tighter pulse-count distributions, particularly for RESET-dominated programming sequences.
+For MLC evaluation, the target is a resistance *window*, not a single state. Two bin-definition modes:
+
+- **`equal`**: equal-width partition of [0, 64] into N levels (~8–16 states per bin). Too wide to produce meaningful BER — any single SET pulse from HRS lands inside the window.
+- **`pba`**: PBA-derived write windows computed from `model/retention1s.csv`. Each write window is **4 ADC states wide**, matching real hardware programming precision. 49/65 states are gaps between windows (for 4-level); landing in a gap is an error.
+
+PBA bin boundaries (derived from characterisation data, `dala.py` algorithm):
+
+| Level | Write window | Read window (post-drift, 1 s) |
+|-------|-------------|-------------------------------|
+| **4-level (2-bit)** | | |
+| 0 (HRS) | [0, 4) | [0, 13) |
+| 1 | [18, 22) | [13, 28) |
+| 2 | [32, 36) | [28, 39) |
+| 3 (LRS) | [42, 46) | [39, 64] |
+| **8-level (3-bit)** | | |
+| 0 (HRS) | [0, 4) | [0, 8) |
+| 1 | [12, 16) | [8, 21) |
+| 2 | [26, 30) | [21, 34) |
+| 3 | [35, 39) | [34, 41) |
+| 4 | [42, 46) | [41, 48) |
+| 5 | [48, 52) | [48, 53) |
+| 6 | [54, 58) | [53, 59) |
+| 7 (LRS) | [59, 63) | [59, 64] |
+
+Write windows are 4 ADC states wide; read windows are wider to absorb 1-second resistance drift.
+
+Run bin-level value iteration for each configuration:
+```
+python markov/bin_vi.py --pw-bins 1 --n-levels 8 --bin-type pba
+```
+Outputs: `bin_value_pw{K}_lv{L}_{type}.npy [65, L]`, `bin_policy_pw{K}_lv{L}_{type}.npy [65, L]`
 
 ---
 
-### Step 8: Multi-Bit Cell Evaluation and Comparison to RADAR/PBA
+### Step 8: BER Evaluation and RADAR Comparison (`markov/run_experiments.py`)
 
-**Goal**: translate the pulse-level MDP results into the metric that matters for real memory systems — bit error rate (BER) when programming a 2-bit (4-level) or 3-bit (8-level) MLC cell — and compare directly against RADAR and PBA.
+#### What the Monte Carlo transition noise models — and what it doesn't
 
-#### Bin definitions
+The transition matrix T[a, s, s'] captures the **total spread** of observed outcomes across all cells — for the same action from the same state, the next state is drawn from this distribution. Running the MC simulation with T already samples from the full population variance, but treats each step's noise as **independent**.
 
-Partition the 65 ADC states into equal-width bins (or PBA-style percentile bins):
+This correctly models *within-cell stochasticity* (per-pulse quantum noise). It does **not** model *between-cell variation*: the fact that cell A is persistently 3 ADC states more SET-sensitive than the average. That persistent bias is a fixed property of each physical cell — the same offset applies to every pulse in that cell's programming sequence — so the policy's corrections are systematically less effective.
 
-| Configuration | Bins | States per bin |
-|--------------|------|----------------|
-| 2-bit MLC    | 4    | ~16 states     |
-| 3-bit MLC    | 8    | ~8 states      |
+The `sigma_cell` parameter adds this persistent-bias component: each simulated cell draws one fixed offset δ ~ N(0, σ²) before its rollout, and every transition in that rollout is shifted by δ. The policy observes the actual (shifted) state and reacts, but its action-value estimates were calibrated on the unbiased model, so it partially but not perfectly compensates.
 
-Each bin represents one resistance level; a cell is correctly programmed if it lands anywhere within the target bin.
+**σ estimate from data**: the retention data (`model/retention1s.csv`) gives a readout spread of **σ ≈ 1.5 ADC units** (median std across write levels at t = 1 s). This is the best available estimate of the persistent cell-to-cell component because it is measured on many cells under the same write condition.
 
-#### MDP reformulation (bin-level targets)
+#### Results: BER vs. RADAR
 
-Re-solve value iteration with bin-level absorbing states: any state within the target bin counts as done. This yields `V_bin[s, b]` — the expected pulses to reach bin `b` from state `s` — and a corresponding optimal bin-level policy. This is the correct formulation for comparing against RADAR (which also targets a resistance window, not a single state).
+All results below use:
+- Start state: ADC state 2 (lowest fully-characterised HRS state; state 0 has no valid outgoing transitions)
+- Bin type: PBA write windows (4 states wide)
+- Write budget: 36 pulses (matching RADAR's reported operating point for 3-bit)
+- σ_cell = 1.5 ADC units (matched to retention data spread)
+- N = 3,000 trials per target bin, 7 non-trivial bins averaged for 8-level, 3 for 4-level
 
-The per-state policy from Step 5 is a suboptimal approximation for this task: it over-commits to a single centroid state and may waste pulses trying to hit an exact level when the cell is already inside the target window.
+| Config | pw_bins | σ_cell | BER @ 36 pulses | Mean pulses (successes) | RADAR reference |
+|--------|---------|--------|-----------------|-------------------------|-----------------|
+| 3-bit (8-level) | 1 | 1.5 | **0.19%** | **3.2** | 1.0% @ 36.4 pulses |
+| 3-bit (8-level) | 4 | 1.5 | 6.6% | 2.4 | 1.0% @ 36.4 pulses |
+| 2-bit (4-level) | 1 | 1.5 | **0.19%** | **3.2** | 0.3% @ ~19 pulses |
+| 2-bit (4-level) | 4 | 1.5 | 5.1% | 3.1 | 0.3% @ ~19 pulses |
 
-#### Monte Carlo BER measurement
+**pw_bins=1 (pooled) beats RADAR on 3-bit**: 0.19% BER vs. 1.0% at the same 36-pulse budget, with 11× fewer mean pulses. The 2-bit comparison is tighter: at budget=36 our BER (0.19%) also beats RADAR's 0.3%, but RADAR reaches its 0.3% target at only 19 pulses; we would need ~budget=20 to achieve equivalent BER.
 
-Simulate the bin-level policy and record:
-- **Success rate**: fraction of rollouts that land in the correct bin
-- **Expected pulses**: total pulses per successful program operation
-- **BER**: per-bit error rate under gray coding, as a function of write budget (pulses)
+**pw_bins=4 is worse than RADAR** under realistic variability. Finer pulse-width control produces a more brittle policy: it picks precisely calibrated fine-grained actions that are optimal for the average cell but more sensitive to individual cell deviations. This is a **precision vs. robustness tradeoff** — higher granularity improves performance without variability (σ=0) but degrades faster as σ increases.
 
-#### Comparison baseline
+#### Pulse-count distribution (pw_bins=1, 8-level, σ=1.5)
 
-RADAR is an iterative write-verify scheme: apply a pulse, read back, repeat until within tolerance. PBA/SBA (from this repo) optimize level allocation but use a fixed write algorithm. The MDP policy is the **theoretical optimum** under the learned transition model — it provides a lower bound on expected pulses for any algorithm operating on the same hardware.
+The distribution is heavily right-skewed:
 
-Report the gap: how many more pulses does RADAR use vs. the MDP optimum for the same target BER?
+| Percentile | Pulse count |
+|------------|-------------|
+| p50 | 2 |
+| p75 | 3 |
+| p90 | 7 |
+| p95 | 10 |
+| p99 | 20 |
+| p99.9 | 45 |
+| max | 113 |
+| mean | 3.1 |
+
+43% of cells converge in a single pulse; 86% in ≤5 pulses. The long tail (p99 = 20 pulses) is produced by cells with large persistent offset (large |δ|) that require iterative correction. The tail behaviour is qualitatively consistent with RADAR's observation that "some cells take upward of 100 pulses" while the majority converge quickly. Notably, **our p99 (20 pulses) is lower than RADAR's reported mean (36.4 pulses)**.
+
+#### Precision vs. robustness: BER vs. σ_cell
+
+Figure `markov/exp_ber_vs_sigma_lv8.png` and `markov/exp_ber_vs_sigma_lv4.png` show BER at budget=50 pulses as a function of σ_cell for each pw_bins configuration:
+
+- At σ=0 (ideal model, no persistent bias): BER=0 for all configurations
+- At σ≥2: pw_bins=1 has substantially lower BER than pw_bins=4
+- pw_bins=4 at σ=1.5 has a ~6% BER floor that does not decrease with larger budget — cells with large |δ| get trapped in correction cycles because the fine-grained policy over-commits to precise actions that the biased cell consistently misses
+
+#### Key figures
+
+| File | Description |
+|------|-------------|
+| `markov/exp_ber_vs_sigma_lv8.png` | BER vs. σ_cell, 3-bit, all pw_bins — shows precision/robustness tradeoff |
+| `markov/exp_ber_vs_sigma_lv4.png` | Same for 2-bit |
+| `markov/exp_expected_pulses.png` | Mean write pulses by (pw_bins, n_levels, bin_type) |
+| `markov/exp_ber_heatmap_pba.png` | BER heatmap at budget=50, PBA bins |
+| `markov/mc_mean_vs_theoretical.png` | Model validation: MC mean matches V[s,t] exactly |
+| `markov/mc_percentiles.png` | p50/p90/p99 pulse-count heatmaps for exact-state policy |
 
 ---
 
