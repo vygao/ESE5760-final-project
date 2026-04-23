@@ -50,6 +50,12 @@ PW_BINS_LIST  = [1, 2, 4]
 N_LEVELS_LIST = [4, 8]
 BIN_TYPES     = ['equal', 'pba']   # set to ['pba'] to only run PBA bins
 
+# Cell-to-cell variability sweep (ADC units, additive offset std dev)
+# sigma=0 → ideal pooled model (current baseline, BER=0)
+# sigma=2 → moderate variability (~1 write window width)
+# sigma=4 → strong variability (~1 write window width for 8-level tight bins)
+SIGMA_CELL_LIST = [0, 1, 2, 3, 4]
+
 START_STATE = 2              # HRS — state 0 has no valid outgoing actions
 N_TRIALS    = 2_000
 MAX_STEPS   = 1_500
@@ -146,14 +152,24 @@ def ensure_bin_policy(pw_bins, n_levels, bin_type, rebuild=False):
 
 # ── Monte Carlo (bin-level, from fixed start state) ───────────────────────────
 
-def run_bin_mc(probs, policy, membership, start_state, n_trials, max_steps, seed):
+def run_bin_mc(probs, policy, membership, start_state, n_trials, max_steps, seed,
+               sigma_cell=0.0):
     """
     Run MC rollouts starting from `start_state`, targeting each bin in turn.
 
+    sigma_cell : float
+        Standard deviation of a fixed per-cell conductance offset (in ADC units).
+        Models cell-to-cell variability: each trial draws δ ~ N(0, sigma_cell²)
+        once before its rollout begins. Every transition outcome is shifted by
+        this fixed δ (clamped to [0, 64]).  The policy observes the shifted
+        (actual) state and reacts, but its action-value estimates were computed
+        under the unbiased model — so it partially but not perfectly adapts,
+        producing non-zero BER for large sigma_cell.
+
     Returns
     -------
-    pulse_counts  : int32 [n_levels, n_trials]  pulses used; max_steps = timed out
-    final_states  : int32 [n_levels, n_trials]  final ADC state of each rollout
+    pulse_counts  : int32 [n_levels, n_trials]
+    final_states  : int32 [n_levels, n_trials]
     timed_out     : bool  [n_levels, n_trials]
     """
     rng = np.random.default_rng(seed)
@@ -162,6 +178,12 @@ def run_bin_mc(probs, policy, membership, start_state, n_trials, max_steps, seed
     pulse_counts = np.zeros((n_levels, n_trials), dtype=np.int32)
     final_states = np.full((n_levels, n_trials), start_state, dtype=np.int32)
     timed_out    = np.zeros((n_levels, n_trials), dtype=bool)
+
+    # Draw fixed per-cell offsets once (same across bins for consistency)
+    if sigma_cell > 0:
+        cell_delta = np.round(rng.normal(0, sigma_cell, size=n_trials)).astype(np.int32)
+    else:
+        cell_delta = np.zeros(n_trials, dtype=np.int32)
 
     for b in range(n_levels):
         current = np.full(n_trials, start_state, dtype=np.int32)
@@ -180,7 +202,10 @@ def run_bin_mc(probs, policy, membership, start_state, n_trials, max_steps, seed
             trans  = probs[a, s, :]
             cdf    = np.cumsum(trans, axis=1)
             u      = rng.uniform(size=active.sum())
-            next_s = (cdf < u[:, None]).sum(axis=1).clip(0, S - 1)
+            next_s = (cdf < u[:, None]).sum(axis=1)
+
+            # Apply per-cell conductance offset and clamp to valid range
+            next_s = np.clip(next_s + cell_delta[active], 0, S - 1).astype(np.int32)
 
             current[active]          = next_s
             pulse_counts[b, active] += 1
@@ -343,6 +368,39 @@ def plot_ber_heatmap(results):
         print(f"Saved {out.name}")
 
 
+def plot_ber_vs_sigma(sigma_results, fixed_budget=50):
+    """
+    BER vs. sigma_cell for each (pw_bins, n_levels) at a fixed write budget.
+    sigma_results: list of (pw_bins, n_levels, sigma, mean_ber_over_non_trivial_bins)
+    One figure per n_levels.
+    """
+    for n_levels in N_LEVELS_LIST:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        colors = {1: '#1f77b4', 2: '#ff7f0e', 4: '#2ca02c'}
+
+        for pw_bins in PW_BINS_LIST:
+            xs = [r[2] for r in sigma_results if r[0] == pw_bins and r[1] == n_levels]
+            ys = [r[3] for r in sigma_results if r[0] == pw_bins and r[1] == n_levels]
+            if not xs:
+                continue
+            ax.plot(xs, ys, marker='o', color=colors.get(pw_bins, 'gray'),
+                    label=f'pw_bins={pw_bins} ({pw_bins*1024} actions)')
+
+        ax.set_xlabel('σ_cell  (per-cell conductance offset, ADC units)', fontsize=11)
+        ax.set_ylabel(f'Write BER  (budget = {fixed_budget} pulses)', fontsize=11)
+        ax.set_title(f'BER vs. cell-to-cell variability — {n_levels}-level '
+                     f'({int(np.log2(n_levels))}-bit), PBA bins\n'
+                     f'Write window width = 4 ADC states', fontsize=10)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.02, 1.05)
+        plt.tight_layout()
+        out = OUT_DIR / f'exp_ber_vs_sigma_lv{n_levels}.png'
+        plt.savefig(out, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {out.name}")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -439,6 +497,40 @@ if __name__ == '__main__':
                 print(f"    Bin {b}: mean={success.mean():.1f}  p90={np.percentile(success,90):.0f}"
                       f"  write_BER@20={ber_20:.4f}  write_BER@100={ber_100:.4f}"
                       f"  timeout={to.mean()*100:.1f}%")
+
+    # ── sigma sweep (PBA bins only, fixed budget) ─────────────────────────────
+    print("\nRunning cell-variability (sigma) sweep on PBA bins...")
+    sigma_results = []   # (pw_bins, n_levels, sigma, mean_ber_at_budget50)
+    budget_50_idx = min(range(len(BUDGETS)), key=lambda i: abs(BUDGETS[i] - 50))
+
+    for pw_bins in PW_BINS_LIST:
+        probs = ensure_transition_matrix(pw_bins, rebuild=False)
+        for n_levels in N_LEVELS_LIST:
+            membership, _, _ = get_membership(n_levels, 'pba')
+            V, policy = ensure_bin_policy(pw_bins, n_levels, 'pba', rebuild=False)
+            trivial = int(membership[START_STATE]) if membership[START_STATE] >= 0 else -1
+            non_trivial = [b for b in range(n_levels) if b != trivial]
+
+            for sigma in SIGMA_CELL_LIST:
+                cache = OUT_DIR / f'exp_sigma_pw{pw_bins}_lv{n_levels}_s{sigma}.npy'
+                cache_to = OUT_DIR / f'exp_sigma_to_pw{pw_bins}_lv{n_levels}_s{sigma}.npy'
+                if cache.exists() and not args.rebuild:
+                    pc = np.load(cache); to = np.load(cache_to)
+                else:
+                    print(f"  sigma={sigma}  pw={pw_bins}  lv={n_levels}")
+                    pc, _, to = run_bin_mc(
+                        probs, policy, membership,
+                        start_state=START_STATE, n_trials=args.n_trials,
+                        max_steps=MAX_STEPS, seed=SEED, sigma_cell=float(sigma),
+                    )
+                    np.save(cache, pc); np.save(cache_to, to)
+
+                ber_at_50 = compute_ber_vs_budget(pc, to, BUDGETS)
+                mean_ber = ber_at_50[non_trivial, budget_50_idx].mean()
+                sigma_results.append((pw_bins, n_levels, sigma, mean_ber))
+                print(f"  pw={pw_bins} lv={n_levels} σ={sigma}  BER@50={mean_ber:.4f}")
+
+    plot_ber_vs_sigma(sigma_results, fixed_budget=BUDGETS[budget_50_idx])
 
     # ── figures ───────────────────────────────────────────────────────────────
     print("\nGenerating comparison figures...")
